@@ -10,31 +10,23 @@ import logging
 # This helps see the outputs clearly
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
-# --- 1. Setup: Client and Tool Definitions ---
+# --- 1. Your Client Setup (from your image) ---
+endpoint = "https://laksh-frame.openai.azure.com/"
+model_name = "gpt-4o"  # This variable isn't used by the client, but good for reference
+deployment = "gpt-4o"  # This is the deployment name the client WILL use
+subscription_key = "YOUR_AZURE_OPENAI_KEY_HERE" # <<< ⚠️ FILL THIS IN
+api_version = "2024-05-01-preview" # Using a more standard, recent version
 
-# IMPORTANT: Set these environment variables in your terminal before running
-# export AZURE_OPENAI_KEY="your-key-here"
-# export AZURE_OPENAI_ENDPOINT="your-endpoint-here"
-YOUR_DEPLOYMENT_NAME = "gpt-4o" # <<< SET THIS to your gpt-4o deployment name
+# Note: Your image shows 2024-12-01-preview. I've used 2024-05-01-preview
+# as it's a known working version. You can change it back if needed.
 
-try:
-    client = AzureOpenAI(
-        api_key=os.environ.get("AZURE_OPENAI_KEY"),
-        api_version="2024-05-01-preview", # Use a recent API version
-        azure_endpoint=os.environ.get("AZURE_OPENAI_ENDPOINT")
-    )
-    # Quick check to see if client is configured
-    if not os.environ.get("AZURE_OPENAI_KEY"):
-        raise ValueError("AZURE_OPENAI_KEY environment variable is not set.")
-    
-except ValueError as e:
-    logging.error(f"Client setup failed: {e}")
-    logging.error("Please set your AZURE_OPENAI_KEY and AZURE_OPENAI_ENDPOINT env variables.")
-    # We'll exit if the client isn't set up, as nothing will work.
-    exit()
+client = AzureOpenAI(
+    api_version=api_version,
+    azure_endpoint=endpoint,
+    api_key=subscription_key,
+)
 
-# Define the tools the agent can choose from
-# Note: Simple, single-word names are best for the logit_bias method.
+# --- 2. Tool Definitions ---
 TOOLS = [
     {"name": "UnlockAccount", "description": "Unlocks a user's account in Active Directory."},
     {"name": "QueryDatabase", "description": "Queries the user incident database for similar issues."},
@@ -54,24 +46,24 @@ def get_tool_token_ids(tool_names_list):
         token_id = tokenizer.encode(name, allowed_special="all")[0]
         
         if token_id in token_map:
-             logging.warning(f"Warning: Tool '{name}' and '{token_map[token_id]}' share the same first token ID ({token_id}). Logit bias may be ambiguous.")
+             logging.warning(f"Warning: Tool '{name}' and '{token_map.get(token_id)}' share the same first token ID ({token_id}). Logit bias may be ambiguous.")
         
-        token_map[name] = token_id
+        # Store as string since JSON keys must be strings
+        token_map[str(token_id)] = name 
         logging.info(f"Tokenizer Map: '{name}' -> Token ID: {token_id}")
     return token_map
 
-# --- 2. Method 1: Logit Inspection (The "True" Way) ---
+# --- 3. Method 1: Logit Inspection (The "True" Way) ---
 
-def get_action_confidence_via_logits(user_query, tool_names_list, tool_token_map):
+def get_action_confidence_via_logits(user_query, tool_names_list, tool_token_map_str_keys):
     """
     Forces the model to choose *only* from the tool list and returns
     the probability distribution over that choice.
     """
     logging.info("--- Starting Method 1: Logit Inspection ---")
     
-    # 1. Create the logit_bias: a dict of {token_id: 100}
-    # This strongly encourages the model to ONLY output one of these tokens.
-    logit_bias = {token_id: 100.0 for token_id in tool_token_map.values()}
+    # 1. Create the logit_bias: a dict of {token_id_str: 100}
+    logit_bias = {token_id: 100.0 for token_id in tool_token_map_str_keys.keys()}
 
     system_prompt = f"""
     You are an agent that must decide the *single best tool* to use.
@@ -81,7 +73,7 @@ def get_action_confidence_via_logits(user_query, tool_names_list, tool_token_map
     
     try:
         response = client.chat.completions.create(
-            model=YOUR_DEPLOYMENT_NAME,
+            model=deployment, # Use your deployment name
             messages=[
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_query}
@@ -127,7 +119,7 @@ def get_action_confidence_via_logits(user_query, tool_names_list, tool_token_map
         logging.error(f"API call failed for Method 1: {e}")
         return None
 
-# --- 3. Method 2: JSON Scoring (The "Practical" Way) ---
+# --- 4. Method 2: JSON Scoring (The "Practical" Way) ---
 
 JSON_SCORING_SYSTEM_PROMPT = """
 You are a helpful assistant. The user will ask a question.
@@ -153,7 +145,7 @@ def get_action_confidence_via_json(user_query, tools_list):
     
     try:
         response = client.chat.completions.create(
-            model=YOUR_DEPLOYMENT_NAME,
+            model=deployment, # Use your deployment name
             messages=[
                 {"role": "system", "content": prompt},
                 {"role": "user", "content": user_query}
@@ -180,7 +172,7 @@ def get_action_confidence_via_json(user_query, tools_list):
         logging.error(f"API call failed for Method 2: {e}")
         return None
 
-# --- 4. Helper Function for SAUP (from our previous PoC) ---
+# --- 5. Helper Function for SAUP (from our previous PoC) ---
 
 def calculate_step_uncertainty(prob_dist_dict):
     """
@@ -202,12 +194,19 @@ def calculate_step_uncertainty(prob_dist_dict):
     return entropy(prob_array) / np.log(len(prob_array))
 
 
-# --- 5. End-to-End Demonstration ---
+# --- 6. End-to-End Demonstration ---
 
 if __name__ == "__main__":
     
+    if subscription_key == "YOUR_AZURE_OPENAI_KEY_HERE":
+        logging.error("="*50)
+        logging.error("SCRIPT STOPPED: Please fill in your `subscription_key` at the top of the file.")
+        logging.error("="*50)
+        exit()
+
     user_query = "My account is locked, I can't log in to Workday. Please help."
     
+    logging.info(f"Client is configured for endpoint: {endpoint}")
     logging.info(f"Processing query: '{user_query}'")
     logging.info("="*40)
     
@@ -231,5 +230,5 @@ if __name__ == "__main__":
         u_n_json = calculate_step_uncertainty(json_probs)
         logging.info(f"Method 2 (JSON) Step Uncertainty (U_n): {u_n_json:.4f}")
         
-    logging.info("="*40)
+    logging.info("="*4S0)
     logging.info("Demonstration complete.")
