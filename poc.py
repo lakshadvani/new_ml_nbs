@@ -7,6 +7,8 @@ from scipy.stats import entropy
 import logging
 import math
 import time
+import torch
+from sentence_transformers import SentenceTransformer, util
 
 # --- Configure Logging ---
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -31,7 +33,7 @@ TOOLS = [
 ]
 TOOL_NAMES = [t['name'] for t in TOOLS]
 
-# --- 3. Live U_n Generation (from Method 2) ---
+# --- 3. Live U_n Generation (Method 2) ---
 
 JSON_SCORING_SYSTEM_PROMPT = """
 You are a helpful assistant. The user will ask a question.
@@ -94,20 +96,30 @@ def calculate_step_uncertainty(prob_dist_dict):
     return entropy(prob_array) / np.log(len(prob_array))
 
 
-# --- 4. SAUP Mocked Components (from "Max Mock" PoC) ---
+# --- 4. SAUP ML Components (GPU-Enabled Distance) ---
 
-def mock_semantic_distance(text_a, text_b):
+class SemanticDistanceModel:
     """
-    (MOCK) Simulates a BERT model using Jaccard Distance.
+    (GPU-ENABLED) This class is the real ML component.
+    It loads a transformer model to calculate semantic distance.
     """
-    try:
-        set_a = set(text_a.lower().split())
-        set_b = set(text_b.lower().split())
-        intersection = len(set_a.intersection(set_b))
-        union = len(set_a.union(set_b))
-        return 1 - (intersection / union) # Jaccard Distance
-    except ZeroDivisionError:
-        return 0.0
+    def __init__(self, model_name='all-MiniLM-L6-v2'):
+        self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
+        self.model_name = model_name
+        self.model = SentenceTransformer(model_name, device=self.device)
+        logging.info(f"[SAUP-Config] SemanticDistanceModel loaded on {self.device}.")
+
+    def get_distance(self, text_a, text_b):
+        """
+        Calculates semantic distance (1 - cosine_similarity).
+        """
+        embeddings = self.model.encode(
+            [text_a, text_b], 
+            convert_to_tensor=True, 
+            device=self.device
+        )
+        cos_sim = util.pytorch_cos_sim(embeddings[0], embeddings[1])
+        return 1 - cos_sim.item()
 
 class MockHMMWeights:
     """
@@ -143,13 +155,13 @@ class SaupAgent:
     """
     An agent that uses SAUP for oversight on every step.
     """
-    def __init__(self, client, deployment_name, tools_list, query):
+    def __init__(self, client, deployment_name, tools_list, query, distance_model):
         self.client = client
         self.deployment = deployment_name
         self.tools = tools_list
         self.Q = query  # The initial user query
+        self.distance_model = distance_model # The GPU-powered distance model
         
-        # These lists will store the full trajectory
         self.Z_list = [] # List of (A, T, O) tuples
         self.U_list = [] # List of U_n floats
         self.D_a_list = [] # List of D_a floats
@@ -190,19 +202,16 @@ class SaupAgent:
         T_n = self.mock_get_thought(current_query, A_n)
         O_n = self.mock_get_observation(A_n)
         
-        # 4. Store the trajectory step
         self.Z_list.append((A_n, T_n, O_n))
 
-        # 5. Calculate Distances (D_a and D_o)
-        # D_a: Drift (Action+Thought vs. *Original* Query)
-        # D_o: Gap (Action vs. Observation)
-        D_a_n = mock_semantic_distance(A_n + T_n, self.Q)
-        D_o_n = mock_semantic_distance(A_n, O_n)
+        # 4. Calculate Distances (D_a and D_o) using the REAL model
+        D_a_n = self.distance_model.get_distance(A_n + T_n, self.Q)
+        D_o_n = self.distance_model.get_distance(A_n, O_n)
         self.D_a_list.append(D_a_n)
         self.D_o_list.append(D_o_n)
         logging.info(f"  [SAUP] Distances: Drift (D_a)={D_a_n:.3f}, Gap (D_o)={D_o_n:.3f}")
         
-        return A_n, O_n # Return action and observation for the next loop
+        return A_n, O_n 
 
     def calculate_final_saup_score(self):
         """
@@ -210,17 +219,14 @@ class SaupAgent:
         """
         logging.info("--- Calculating Final SAUP Score ---")
         
-        # 1. Get Situational Weights (W_list)
         D_combined = [(da + do) for da, do in zip(self.D_a_list, self.D_o_list)]
         hmm_model = MockHMMWeights()
         W_list = hmm_model.get_weights(D_combined)
         
-        # 2. Aggregate final score (U_agent)
         U_agent = saup_aggregation(self.U_list, W_list)
         
-        # --- Print a full report ---
         print("\n" + "="*60)
-        print("Trajectory Analysis Report")
+        print("Trajectory Analysis Report (GPU-Powered)")
         print("="*60)
         print(f"Initial Query (Q): {self.Q}\n")
         print(f"{'Step':<5} | {'Action (A_n)':<16} | {'U_n':<6} | {'D_a':<6} | {'D_o':<6} | {'W_n':<6}")
@@ -242,6 +248,14 @@ if __name__ == "__main__":
         logging.error("="*50)
         exit()
 
+    # --- Load ML Models (once) ---
+    try:
+        distance_model = SemanticDistanceModel()
+    except Exception as e:
+        logging.error(f"FATAL: Could not load SentenceTransformer model: {e}")
+        logging.error("Please run: pip install torch sentence-transformers")
+        exit()
+        
     user_query = "My account is locked, I can't log in to Workday. Please help."
     
     logging.info(f"Client configured for: {endpoint}")
@@ -250,21 +264,24 @@ if __name__ == "__main__":
     
     OVERSIGHT_THRESHOLD = 0.5
     
-    # 1. Initialize the agent
-    agent = SaupAgent(client, deployment, TOOLS, user_query)
+    # 1. Initialize the agent (and pass it the distance model)
+    agent = SaupAgent(client, deployment, TOOLS, user_query, distance_model)
     
     # 2. Run the agent's plan (simulating a 2-step plan)
-    # This is our ReAct-style loop
     current_context = user_query
-    for i in range(2): # Let's simulate a 2-step plan
+    for i in range(2): # Simulate a 2-step plan
         logging.info(f"\n--- Running Agent Step {i+1} ---")
-        A_n, O_n = agent.run_step(current_context)
+        A_n_O_n = agent.run_step(current_context)
+        if not A_n_O_n:
+            logging.error("Agent step failed. Stopping plan.")
+            break
+        
+        A_n, O_n = A_n_O_n
         
         if A_n == "EscalateToHuman":
             logging.info("  [Agent] Action is 'EscalateToHuman'. Stopping plan.")
             break
         
-        # The observation from this step becomes the context for the next
         current_context = O_n 
 
     # 3. Calculate the final score for the *entire plan*
